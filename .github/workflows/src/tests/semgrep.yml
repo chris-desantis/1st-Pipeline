@@ -1,0 +1,13 @@
+rules:
+  - id: py-unsafe-eval
+    patterns:
+      - pattern: eval($X)
+    message: Avoid eval(); use safer parsing.
+    severity: ERROR
+    languages: [python]
+  - id: py-hardcoded-secret
+    patterns:
+      - pattern: $X = "$SECRET"
+    message: Possible hardcoded secret.
+    severity: WARNING
+    languages: [python]
