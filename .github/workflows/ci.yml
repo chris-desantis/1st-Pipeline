@@ -1,0 +1,148 @@
+name: secure-ci-cd
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  security-events: write   # for SARIF uploads
+  id-token: write          # for OIDC to cloud (optional)
+
+jobs:
+  setup:
+    name: Setup toolchain
+    runs-on: ubuntu-latest
+    outputs:
+      python-version: ${{ steps.py.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Security tooling
+          pip install semgrep trufflehog pip-audit
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    needs: [ setup ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: semgrep --config .semgrep.yml --json > semgrep.json || true
+      - name: Convert to SARIF
+        run: semgrep --config .semgrep.yml --sarif > semgrep.sarif || true
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+      - name: Enforce findings threshold
+        run: |
+          jq '.runs[].results | length' semgrep.sarif | awk '{s+=$1} END{if (s>0) {print "Semgrep findings: " s; exit 1}}'
+
+  secrets:
+    name: Secrets scanning (TruffleHog)
+    runs-on: ubuntu-latest
+    needs: [ setup ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: TruffleHog
+        run: trufflehog filesystem --directory . --json > trufflehog.json || true
+      - name: Fail on high-confidence secrets
+        run: |
+          python - << 'PY'
+          import json, sys
+          data=json.load(open('trufflehog.json'))
+          high=[f for f in data if f.get('verified') or f.get('entropy')>3.5]
+          print(f"High-confidence: {len(high)}")
+          sys.exit(1 if len(high)>0 else 0)
+          PY
+
+  dependency:
+    name: Dependency vulnerabilities
+    runs-on: ubuntu-latest
+    needs: [ setup ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: pip-audit
+        run: pip-audit -r requirements.txt --fail-on=medium
+
+  test:
+    name: Unit/Integration tests
+    runs-on: ubuntu-latest
+    needs: [ setup, sast, secrets, dependency ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests with coverage
+        run: |
+          pip install pytest pytest-cov
+          pytest -q --disable-warnings --maxfail=1 --cov=src --cov-report=xml
+      - name: Upload coverage (optional)
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: true
+
+  build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: [ test ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t ${{ github.repository }}:${{ github.sha }} .
+      - name: Tag
+        run: docker tag ${{ github.repository }}:${{ github.sha }} ${{ github.repository }}:latest
+      - name: Save artifact
+        run: |
+          docker save ${{ github.repository }}:${{ github.sha }} | gzip > image.tar.gz
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+
+  deploy_dev:
+    name: Deploy to dev (gated)
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.app_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: .
+      - name: Load image
+        run: gunzip -c image.tar.gz | docker load
+      - name: Authenticate to registry (example)
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login -u "${{ secrets.REGISTRY_USER }}" --password-stdin registry.example.com
+      - name: Push image
+        run: docker push registry.example.com/${{ github.repository }}:${{ github.sha }}
+      - name: Deploy (Kubernetes placeholder)
+        id: deploy
+        run: |
+          # e.g., helm upgrade --install ...
+          echo "Deploying to dev..."
+          echo "app_url=https://dev.example.com" >> $GITHUB_OUTPUT
